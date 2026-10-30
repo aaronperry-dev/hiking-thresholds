@@ -4,14 +4,10 @@ import numpy as np
 import json
 import argparse
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import sys
 
 def elevation_to_pressure_hpa(elevation_m):
-    """
-    Converts height above sea level in meters to atmospheric pressure in hPa
-    using the International Standard Atmosphere (ISA) barometric equation.
-    """
     if elevation_m is None or elevation_m <= 0:
         return 800.0
     p0 = 1013.25
@@ -21,7 +17,6 @@ def elevation_to_pressure_hpa(elevation_m):
     return round(float(p_target), 1)
 
 def geocode_location(location_query):
-    """Uses Open-Meteo's Geocoding API to resolve coordinates and true summit elevation."""
     url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(location_query)}&count=1&language=en&format=json"
     resp = requests.get(url)
     
@@ -62,7 +57,6 @@ def align_to_master(model_times, model_data, master_times):
     return aligned
 
 def fetch_dynamic_levels(model, lat, lon, start_date, end_date, target_p):
-    """Fetches candidate pressure levels around target_p across the date range and log-interpolates."""
     candidate_levels = [950, 925, 900, 850, 825, 800, 775, 750, 700, 600, 500]
     valid_data = {}
     
@@ -113,7 +107,6 @@ def fetch_dynamic_levels(model, lat, lon, start_date, end_date, target_p):
     return t_interp.tolist(), w_interp.tolist(), valid_data[lower_p]["times"]
 
 def fetch_model_precipitation(model, lat, lon, elevation_m, start_date, end_date):
-    """Fetches precipitation, rain, snowfall, and WMO weather codes downscaled to summit elevation."""
     url = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&elevation={elevation_m}"
            f"&start_date={start_date}&end_date={end_date}"
            f"&hourly=precipitation,rain,snowfall,weather_code"
@@ -129,7 +122,6 @@ def fetch_model_precipitation(model, lat, lon, elevation_m, start_date, end_date
             hourly.get("time")
         )
     
-    # Fallback without rain/snowfall decomposition
     url_fallback = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&elevation={elevation_m}"
                     f"&start_date={start_date}&end_date={end_date}"
                     f"&hourly=precipitation,weather_code"
@@ -147,10 +139,6 @@ def fetch_model_precipitation(model, lat, lon, elevation_m, start_date, end_date
     return None, None, None, None, None
 
 def classify_precipitation_types(precip_arr, rain_arr, snow_arr, wcode_arr, temp_arr):
-    """
-    Partitions hourly precipitation amounts (in.) into Rain, Snow, and Mixed (Sleet, Freezing Rain)
-    using WMO weather interpretation codes and summit temperatures.
-    """
     n = len(precip_arr)
     rain_out = np.zeros(n)
     snow_out = np.zeros(n)
@@ -164,29 +152,25 @@ def classify_precipitation_types(precip_arr, rain_arr, snow_arr, wcode_arr, temp
         t = temp_arr[i] if (temp_arr is not None and not np.isnan(temp_arr[i])) else 32.0
         wcode = wcode_arr[i] if (wcode_arr is not None and wcode_arr[i] is not None) else None
         
-        # 1. Direct WMO Weather Code Classification
-        if wcode in [56, 57, 66, 67, 79]:  # Freezing Drizzle, Freezing Rain, Sleet/Ice Pellets
+        if wcode in [56, 57, 66, 67, 79]: 
             mixed_out[i] = p
-        elif wcode in [71, 73, 75, 77, 85, 86]:  # Snow fall, Snow grains, Snow showers
+        elif wcode in [71, 73, 75, 77, 85, 86]:
             snow_out[i] = p
-        elif wcode in [51, 53, 55, 61, 63, 65, 80, 81, 82]:  # Liquid Drizzle, Rain, Showers
+        elif wcode in [51, 53, 55, 61, 63, 65, 80, 81, 82]:
             if t <= 32.0:
-                mixed_out[i] = p  # Liquid rain falling into freezing surface air = Freezing Rain
+                mixed_out[i] = p 
             else:
                 rain_out[i] = p
-        # 2. Temperature & Model Decomposition Fallback
         else:
             if t <= 28.0:
                 snow_out[i] = p
             elif 28.0 < t <= 32.0:
-                # Borderline sub-freezing: if model indicates liquid, treat as Freezing Rain (Mixed)
                 r_val = rain_arr[i] if (rain_arr is not None and not np.isnan(rain_arr[i])) else 0.0
                 if r_val > 0.005:
                     mixed_out[i] = p
                 else:
                     snow_out[i] = p
             elif 32.0 < t <= 34.0:
-                # Transition zone right above freezing
                 s_val = snow_arr[i] if (snow_arr is not None and not np.isnan(snow_arr[i])) else 0.0
                 r_val = rain_arr[i] if (rain_arr is not None and not np.isnan(rain_arr[i])) else 0.0
                 if s_val > 0.005 and r_val > 0.005:
@@ -200,37 +184,208 @@ def classify_precipitation_types(precip_arr, rain_arr, snow_arr, wcode_arr, temp
 
     return rain_out, snow_out, mixed_out
 
-def generate_dashboard(hc_display_times, res_t, res_w, res_g, res_c, res_p, df_t, df_w, df_g, df_c, df_p, df_ens_t, df_ens_w, df_ens_g, df_ens_c, df_ens_p, blended_rain, blended_snow, blended_mixed, date_label, location_name, elevation_m, target_p, successful_models, ens_count):
+def fetch_kmwn_mos(cycle, elevation_m, master_times_api):
+    now_utc = datetime.now(timezone.utc)
+    candidate_dates = [now_utc.strftime("%Y%m%d"), (now_utc - timedelta(days=1)).strftime("%Y%m%d"), (now_utc - timedelta(days=2)).strftime("%Y%m%d")]
+    
+    resp, date_str = None, None
+    for d in candidate_dates:
+        url_mex = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs_mos/prod/gfs_mos.{d}/mdl_gfsmex.t{cycle}z"
+        resp_mex = requests.get(url_mex, timeout=10)
+        if resp_mex.status_code == 200:
+            resp = resp_mex
+            date_str = d
+            break
+            
+        url_mav = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs_mos/prod/gfs_mos.{d}/mdl_gfsmav.t{cycle}z"
+        resp_mav = requests.get(url_mav, timeout=10)
+        if resp_mav.status_code == 200:
+            resp = resp_mav
+            date_str = d
+            break
+            
+    if resp is None:
+        return None, None
+        
+    block = []
+    in_block = False
+    for line in resp.text.split('\n'):
+        if line.strip().startswith("KMWN") and "MOS GUIDANCE" in line:
+            in_block = True
+        if in_block:
+            block.append(line)
+            if line.strip() == "" and len(block) > 5:
+                break
+                
+    if not block: return None, None
+    
+    hr_line = next((l for l in block if l.startswith("HR ") or l.startswith("FHR")), None)
+    tmp_line = next((l for l in block if l.startswith("TMP")), None)
+    wsp_line = next((l for l in block if l.startswith("WSP")), None)
+    
+    if not (hr_line and tmp_line and wsp_line):
+        return None, None
+        
+    is_fhr = "FHR" in hr_line
+    mos_times, mos_temps, mos_winds = [], [], []
+    base_dt = datetime.strptime(date_str, "%Y%m%d") + timedelta(hours=int(cycle))
+    current_dt = base_dt
+    last_hr = -1
+    
+    hr_cols = hr_line[4:].replace('|', ' ').split()
+    tmp_cols = tmp_line[4:].replace('|', ' ').split()
+    wsp_cols = wsp_line[4:].replace('|', ' ').split()
+    
+    for i in range(min(len(hr_cols), len(tmp_cols), len(wsp_cols))):
+        if not hr_cols[i].isdigit(): continue
+        hr_val = int(hr_cols[i])
+        
+        if is_fhr: 
+            step_dt = base_dt + timedelta(hours=hr_val)
+        else:      
+            if hr_val < last_hr:
+                current_dt += timedelta(days=1)
+            step_dt = current_dt.replace(hour=hr_val)
+            last_hr = hr_val
+            
+        mos_times.append(step_dt.strftime('%Y-%m-%dT%H:%M'))
+        
+        t_str = tmp_cols[i]
+        mos_temps.append(float(t_str) if t_str.lstrip('-').isdigit() else np.nan)
+        
+        w_str = wsp_cols[i]
+        mos_winds.append(float(w_str) * 1.15078 if w_str.isdigit() else np.nan)
+            
+    delta_m = elevation_m - 1917
+    lapse_adj_f = delta_m * -0.0117
+    adj_temps = [t + lapse_adj_f if not np.isnan(t) else np.nan for t in mos_temps]
+    
+    df_mos = pd.DataFrame({"time": mos_times, "t": adj_temps, "w": mos_winds})
+    df_mos['time'] = pd.to_datetime(df_mos['time'])
+    df_mos.set_index('time', inplace=True)
+    
+    target_idx = pd.to_datetime(master_times_api)
+    df_interp = df_mos.reindex(df_mos.index.union(target_idx)).interpolate(method='time').reindex(target_idx)
+    
+    return df_interp['t'].tolist(), df_interp['w'].tolist()
+
+def build_mwo_text_forecast_html(dates, res_t, res_w, res_g, res_c, res_p, rain, snow, mixed):
+    html = "<div class='card'><h3>Observer-Style Text Forecast (Ensemble-Enhanced)</h3>"
+    periods = {}
+    
+    for i, d_str in enumerate(dates):
+        dt = datetime.strptime(d_str, '%Y-%m-%dT%H:%M')
+        if 6 <= dt.hour < 18:
+            p_name = dt.strftime('%A')
+        else:
+            if dt.hour < 6:
+                p_name = (dt - timedelta(days=1)).strftime('%A Night')
+            else:
+                p_name = dt.strftime('%A Night')
+                
+        if p_name not in periods:
+            periods[p_name] = {'idx': []}
+        periods[p_name]['idx'].append(i)
+        
+    for p_name, data in periods.items():
+        idx = data['idx']
+        if not idx: continue
+        
+        t_med = res_t.loc[idx, 'MEDIAN'].values
+        
+        w_med = res_w.loc[idx, 'MEDIAN'].values
+        g_med = res_g.loc[idx, 'MEDIAN'].values
+        
+        c_med = res_c.loc[idx, 'MEDIAN'].values
+        
+        p_med = res_p.loc[idx, 'MEDIAN'].values
+        p_90 = res_p.loc[idx, 'P90'].values
+        
+        s_sum = sum(snow[i] for i in idx)
+        m_sum = sum(mixed[i] for i in idx)
+        r_sum = sum(rain[i] for i in idx)
+        p90_sum = np.nansum(p_90)
+        pmed_sum = np.nansum(p_med)
+        
+        weather = "In and out of the clouds under partly sunny skies." if 'Night' not in p_name else "In the clear under partly cloudy skies."
+        precip_types = []
+        if m_sum > 0.02: precip_types.append("a wintry mix")
+        if r_sum > 0.02: precip_types.append("rain")
+        if s_sum > 0.02: precip_types.append("snow showers")
+        
+        if precip_types:
+            weather = "Mostly in the clouds w/ a chance of " + " and ".join(precip_types) + "."
+            if s_sum > 0.02:
+                ratio = (p90_sum / pmed_sum) if pmed_sum > 0 else 2.0
+                s_max = s_sum * ratio
+                if s_max < 0.1: s_max = 0.1
+                weather += f" Possible snow accumulations of {s_sum:.1f} to {s_max:.1f} inches."
+            
+        t_max_med = np.nanmax(t_med)
+        t_min_med = np.nanmin(t_med)
+        t_start = t_med[0]
+        t_end = t_med[-1]
+        
+        if 'Night' in p_name:
+            if t_end > t_start + 5:
+                temp_str = f"Low: Starting near {t_min_med:.0f}°F then rising to {t_end:.0f}°F"
+            else:
+                temp_str = f"Low: Around {t_min_med:.0f}°F"
+        else:
+            if t_end < t_start - 5:
+                temp_str = f"High: Starting near {t_max_med:.0f}°F then falling to {t_end:.0f}°F"
+            else:
+                temp_str = f"High: Around {t_max_med:.0f}°F"
+            
+        w_min = 5 * round(np.nanmin(w_med)/5)
+        w_max = 5 * round(np.nanmax(w_med)/5)
+        g_max = 5 * round(np.nanmax(g_med)/5)
+        
+        if w_max == w_min: w_max += 5
+        
+        wind_str = f"Winds {w_min:.0f}-{w_max:.0f} mph w/ gusts up to {g_max:.0f} mph."
+        
+        def fmt_c(val):
+            return f"{abs(val):.0f} below" if val < 0 else f"{val:.0f} above"
+            
+        c_min = np.nanmin(c_med)
+        c_max = np.nanmax(c_med)
+        
+        chill_str = f"{fmt_c(c_min)} to {fmt_c(c_max)}."
+        
+        html += f"<h4>{p_name}:</h4><p style='margin: 4px 0 6px; font-size: 0.95em;'>{weather}</p>"
+        html += f"<ul style='margin-top: 0; margin-bottom: 12px; padding-left: 20px; font-size: 0.95em;'>"
+        
+        parts = temp_str.split(':', 1)
+        html += f"<li><strong>{parts[0]}:</strong> {parts[1].strip() if len(parts) > 1 else ''}</li>"
+        html += f"<li><strong>Wind:</strong> {wind_str}</li>"
+        html += f"<li><strong>Wind Chill:</strong> {chill_str}</li></ul>"
+        
+    html += "</div>"
+    return html
+
+def generate_dashboard(master_times_api, hc_display_times, res_t, res_w, res_g, res_c, res_p, df_t, df_w, df_g, df_c, df_p, df_ens_t, df_ens_w, df_ens_g, df_ens_c, df_ens_p, blended_rain, blended_snow, blended_mixed, date_label, location_name, elevation_m, target_p, successful_models, ens_count):
+    mwo_forecast_html = build_mwo_text_forecast_html(
+        master_times_api, res_t, res_w, res_g, res_c, res_p, blended_rain, blended_snow, blended_mixed
+    )
+
     def to_hc_series(df, name_prefix, dash_style='Solid', median_color='#000000', decimals=1):
         series = []
         for col in df.columns:
-            if col == 'P50': continue
             data = [None if pd.isna(x) else round(x, decimals) for x in df[col].tolist()]
             lw, c, zi = (3, median_color, 10) if col == 'MEDIAN' else (1, '#cccccc', 1)
             series.append({"name": f"{name_prefix} {col}", "data": data, "dashStyle": dash_style, "lineWidth": lw, "color": c, "zIndex": zi})
         return series
 
-    model_colors = {"ncep_gfs_seamless": "#E91E63",
-                    "dwd_seamless": "#8BC34A",
-                    "ecmwf_ifs04": "#9C27B0",
-                    "gem_global": "#4CAF50",
-                    "icon_global": "#FFC107",
-                    "ecmwf_aifs04": "#673AB7",
-                    "ukmo_seamless": "#00BCD4",
-                    "jma_seamless": "#F44336",
-                    "hrrr_conus": "#8BC34A",
-                    "rap_conus": "#FF9800"}
+    model_colors = {"ncep_gfs_seamless": "#E91E63", "dwd_seamless": "#8BC34A", "ecmwf_ifs04": "#9C27B0",
+                    "gem_global": "#4CAF50", "icon_global": "#FFC107", "ecmwf_aifs04": "#673AB7",
+                    "ukmo_seamless": "#00BCD4", "jma_seamless": "#F44336", "hrrr_conus": "#8BC34A",
+                    "rap_conus": "#FF9800", "gfs_mos_kmwn": "#FF5722"}
                     
-    model_names = {"ncep_gfs_seamless": "GFS",
-                   "dwd_seamless": "DWD",
-                   "ecmwf_ifs04": "ECMWF",
-                   "gem_global": "GEM",
-                   "icon_global": "ICON",
-                   "ecmwf_aifs04": "AIFS",
-                   "ukmo_seamless": "UKMET",
-                   "jma_seamless": "JMA",
-                   "hrrr_conus": "HRRR",
-                   "rap_conus": "RAP"}
+    model_names = {"ncep_gfs_seamless": "GFS", "dwd_seamless": "DWD", "ecmwf_ifs04": "ECMWF",
+                   "gem_global": "GEM", "icon_global": "ICON", "ecmwf_aifs04": "AIFS",
+                   "ukmo_seamless": "UKMET", "jma_seamless": "JMA", "hrrr_conus": "HRRR",
+                   "rap_conus": "RAP", "gfs_mos_kmwn": "GFS MOS (Extrapolated)"}
 
     def to_hc_raw_series(df, metric_name, dash_style='Dot', decimals=1):
         series = []
@@ -241,7 +396,13 @@ def generate_dashboard(hc_display_times, res_t, res_w, res_g, res_c, res_p, df_t
 
     def to_hc_ens_series(df, metric_name, dash_style='LongDash', decimals=1):
         series = []
-        ens_colors = {"GEFS Mean": "#E91E63", "EPS Mean": "#9C27B0", "GEPS Mean": "#4CAF50"}
+        ens_colors = {
+            "GEFS Mean": "#E91E63", 
+            "EPS Mean": "#9C27B0", 
+            "GEPS Mean": "#4CAF50",
+            "DWD ENS Mean": "#FFC107",
+            "GDMENS Mean": "#00BCD4"
+        }
         for col in df.columns:
             data = [None if pd.isna(x) else round(x, decimals) for x in df[col].tolist()]
             series.append({"name": f"{col} ({metric_name})", "data": data, "dashStyle": dash_style, "lineWidth": 2, "color": ens_colors.get(col, '#000000'), "visible": False, "zIndex": 6})
@@ -251,7 +412,6 @@ def generate_dashboard(hc_display_times, res_t, res_w, res_g, res_c, res_p, df_t
     combined_wind = to_hc_series(res_w, "Wind Speed", "Solid", "#03A9F4") + to_hc_series(res_g, "Wind Gust", "ShortDash", "#0277BD") + to_hc_raw_series(df_w, "Speed", "Solid") + to_hc_raw_series(df_g, "Gust", "ShortDash") + to_hc_ens_series(df_ens_w, "Speed", "LongDash") + to_hc_ens_series(df_ens_g, "Gust", "LongDash")
     combined_chill = to_hc_series(res_c, "Chill", median_color="#673AB7") + to_hc_raw_series(df_c, "Chill") + to_hc_ens_series(df_ens_c, "Chill")
 
-    # Precipitation Highcharts Series: Stacked Columns (Types) + Percentile Lines (Total)
     precip_stacked_types = [
         {"type": "column", "name": "Snow (Liquid Equiv)", "data": [round(x, 2) for x in blended_snow], "stack": "precip", "color": "#64B5F6", "zIndex": 4},
         {"type": "column", "name": "Mixed (Sleet / Freezing Rain)", "data": [round(x, 2) for x in blended_mixed], "stack": "precip", "color": "#BA68C8", "zIndex": 4},
@@ -267,7 +427,12 @@ def generate_dashboard(hc_display_times, res_t, res_w, res_g, res_c, res_p, df_t
     <meta charset="UTF-8">
     <title>{location_name} Summit Dashboard - {date_label}</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highcharts/11.3.0/highcharts.js"></script>
-    <style>body {{ font-family: Arial; background: #f4f4f4; padding: 20px; }} .card {{ max-width: 1200px; margin: 0 auto 20px; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }} .chart-container {{ height: 500px; }}</style>
+    <style>
+        body {{ font-family: Arial; background: #f4f4f4; padding: 20px; }} 
+        .card {{ max-width: 1200px; margin: 0 auto 20px; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }} 
+        .chart-container {{ height: 500px; }}
+        h4 {{ margin-bottom: 2px; color: #333; font-size: 1.1em; }}
+    </style>
 </head>
 <body>
     <h1 style="text-align: center;">{location_name} Summit Forecast ({date_label})</h1>
@@ -276,9 +441,12 @@ def generate_dashboard(hc_display_times, res_t, res_w, res_g, res_c, res_p, df_t
         <p><strong>Summit Elevation:</strong> {elevation_m}m ({elev_ft} ft)</p>
         <p><strong>Derived Target Atmospheric Pressure:</strong> {target_p} hPa (ISA Standard Profile)</p>
         <p><strong>Deterministic Models Blended:</strong> {", ".join([model_names.get(m, m) for m in successful_models])}</p>
-        <p><strong>Ensembles Blended:</strong> {ens_count} total members (GEFS, GEPS, EPS)</p>
-        <p style="color: #555; font-size: 0.9em;"><em>Note: All models and ensemble members are log-interpolated to the exact summit elevation pressure profile ({target_p} hPa). Precipitation is partitioned into Rain, Snow, and Mixed based on atmospheric temperature profiles and WMO weather codes.</em></p>
+        <p><strong>Ensembles Blended:</strong> {ens_count} total members (GEFS, GEPS, EPS, DWD ENS, GDMENS)</p>
+        <p style="color: #555; font-size: 0.9em;"><em>Note: All models and ensemble members are log-interpolated to the exact summit elevation pressure profile ({target_p} hPa). Precipitation is partitioned into Rain, Snow, and Mixed based on atmospheric temperature profiles and WMO weather codes. GFS MOS extrapolated based on ISA lapse rate from 1917m.</em></p>
     </div>
+    
+    {mwo_forecast_html}
+
     <div class="card chart-container" id="temp-chart"></div>
     <div class="card chart-container" id="wind-chart"></div>
     <div class="card chart-container" id="chill-chart"></div>
@@ -389,7 +557,7 @@ def generate_dashboard(hc_display_times, res_t, res_w, res_g, res_c, res_p, df_t
         f.write(html_template)
     print("\nDashboard successfully exported to forecast_dashboard.html\n")
 
-def get_blended_forecast(start_date, end_date, location_query):
+def get_blended_forecast(start_date, end_date, location_query, mos_cycle_input):
     date_label = start_date if start_date == end_date else f"{start_date} to {end_date}"
     print(f"Resolving location: {location_query}")
     lat, lon, elevation_m, location_name = geocode_location(location_query)
@@ -417,21 +585,12 @@ def get_blended_forecast(start_date, end_date, location_query):
         time_col_width = 14
         time_hdr = "Date/Time"
     
-    deterministic_models = ["ncep_gfs_seamless",
-                            "dwd_seamless",
-                            "ecmwf_ifs04",
-                            "gem_global",
-                            "icon_global",
-                            "ecmwf_aifs04",
-                            "ukmo_seamless",
-                            "jma_seamless",
-                            "hrrr_conus",
-                            "rap_conus"]
+    deterministic_models = ["ncep_gfs_seamless", "dwd_seamless", "ecmwf_ifs04", "gem_global", 
+                            "icon_global", "ecmwf_aifs04", "ukmo_seamless", "jma_seamless", 
+                            "hrrr_conus", "rap_conus"]
                             
-    ensemble_models = {"ncep_gefs_seamless": "GEFS",
-                       "ecmwf_ifs025_ensemble": "EPS",
-                       "gem_global_ensemble": "GEPS",
-                       "dwd_icon_ensemble": "DWD ENS",
+    ensemble_models = {"ncep_gefs_seamless": "GEFS", "ecmwf_ifs025_ensemble": "EPS", 
+                       "gem_global_ensemble": "GEPS", "icon_seamless": "DWD ENS", 
                        "google_weathernext2_ensemble": "GDMENS"}
     
     temps, winds, gusts, chills, precips = {}, {}, {}, {}, {}
@@ -440,7 +599,6 @@ def get_blended_forecast(start_date, end_date, location_query):
     
     print("Fetching Deterministic Models...\n")
     for m in deterministic_models:
-        # 1. Fetch atmospheric pressure level profiles (Temp, Wind)
         raw_t, raw_w, model_times = fetch_dynamic_levels(m, lat, lon, start_date, end_date, target_p)
         if raw_t is None:
             print(f"Skipping {m}: No pressure data available for this range/level.")
@@ -449,7 +607,6 @@ def get_blended_forecast(start_date, end_date, location_query):
         t_aligned = align_to_master(model_times, raw_t, master_times_api)
         w_aligned = align_to_master(model_times, raw_w, master_times_api)
         
-        # 2. Fetch precipitation fields downscaled to summit elevation
         p_raw, r_raw, s_raw, wc_raw, p_times = fetch_model_precipitation(m, lat, lon, elevation_m, start_date, end_date)
         if p_raw is not None:
             p_aligned = align_to_master(p_times, p_raw, master_times_api)
@@ -457,7 +614,6 @@ def get_blended_forecast(start_date, end_date, location_query):
             s_aligned = align_to_master(p_times, s_raw, master_times_api) if s_raw else np.full(len(master_times_api), np.nan)
             wc_aligned = align_to_master(p_times, wc_raw, master_times_api) if wc_raw else np.full(len(master_times_api), np.nan)
             
-            # Classify precipitation types
             r_typed, s_typed, m_typed = classify_precipitation_types(p_aligned, r_aligned, s_aligned, wc_aligned, t_aligned)
             
             precips[m] = p_aligned
@@ -472,6 +628,20 @@ def get_blended_forecast(start_date, end_date, location_query):
         temps[m], winds[m] = t_aligned, w_aligned
         gusts[m], chills[m] = w_aligned * 1.4, calculate_wind_chill(t_aligned, w_aligned)
         successful_models.append(m)
+
+    print("\nFetching GFS MOS Guidance (KMWN)...")
+    mos_t, mos_w = fetch_kmwn_mos(mos_cycle_input, elevation_m, master_times_api)
+    if mos_t and mos_w and not all(np.isnan(x) for x in mos_t):
+        print(f"Successfully loaded GFS MOS {mos_cycle_input}Z (Extrapolated {elevation_m - 1917:+.1f}m from KMWN)")
+        mos_key = "gfs_mos_kmwn"
+        temps[mos_key] = mos_t
+        winds[mos_key] = mos_w
+        gusts[mos_key] = [w * 1.4 if not np.isnan(w) else np.nan for w in mos_w]
+        chills[mos_key] = calculate_wind_chill(np.array(mos_t), np.array(mos_w)).tolist()
+        precips[mos_key] = np.full(len(master_times_api), np.nan) 
+        successful_models.append(mos_key)
+    else:
+        print(f"GFS MOS {mos_cycle_input}Z not available or failed to parse for target dates.")
 
     print("\nFetching Ensemble Members from Open-Meteo API...")
     ens_keys_total = []
@@ -536,8 +706,21 @@ def get_blended_forecast(start_date, end_date, location_query):
     df_g, df_c = pd.DataFrame(gusts), pd.DataFrame(chills)
     df_p = pd.DataFrame(precips)
     
-    # Calculate Ensemble Means
-    ens_families = {"gfs_seamless": "GEFS Mean", "ecmwf_ifs025_ensemble": "EPS Mean", "gem_global": "GEPS Mean"}
+    if "Washington" in location_name:
+        print("\nApplying topographical wind multiplier (1.45x) for Mount Washington...")
+        df_w = df_w * 1.45
+        df_g = df_g * 1.45
+        for col in df_c.columns:
+            if col in df_t.columns and col in df_w.columns:
+                df_c[col] = calculate_wind_chill(df_t[col].values, df_w[col].values)
+    
+    ens_families = {
+        "ncep_gefs_seamless": "GEFS Mean", 
+        "ecmwf_ifs025_ensemble": "EPS Mean", 
+        "gem_global_ensemble": "GEPS Mean",
+        "icon_seamless": "DWD ENS Mean",
+        "google_weathernext2_ensemble": "GDMENS Mean"
+    }
     ens_means_t, ens_means_w, ens_means_g, ens_means_c, ens_means_p = {}, {}, {}, {}, {}
     
     for fam_key, fam_name in ens_families.items():
@@ -558,13 +741,12 @@ def get_blended_forecast(start_date, end_date, location_query):
 
     def calc_percentiles(df):
         with np.errstate(all='ignore'):
-            return pd.DataFrame(np.nanpercentile(df.values, [0, 10, 25, 50, 50, 75, 90, 100], axis=1).T, columns=['MIN', 'P10', 'P25', 'P50', 'MEDIAN', 'P75', 'P90', 'MAX'])
+            return pd.DataFrame(np.nanpercentile(df.values, [0, 10, 25, 50, 50, 75, 90, 100], axis=1, method='weibull').T, columns=['MIN', 'P10', 'P25', 'P50', 'MEDIAN', 'P75', 'P90', 'MAX'])
 
     res_t, res_w = calc_percentiles(df_t), calc_percentiles(df_w)
     res_g, res_c = calc_percentiles(df_g), calc_percentiles(df_c)
     res_p = calc_percentiles(df_p)
     
-    # Calculate Blended Precipitation-Typed Amounts (Rain, Snow, Mixed)
     num_timesteps = len(master_times_api)
     blended_rain = np.zeros(num_timesteps)
     blended_snow = np.zeros(num_timesteps)
@@ -617,9 +799,8 @@ def get_blended_forecast(start_date, end_date, location_query):
             print(f"{display_times[i] if m_idx == 0 else '':>{time_col_width}} {metric_name:>9} {fmt(df_metric.iloc[i]['MIN'], is_p)} {fmt(df_metric.iloc[i]['P10'], is_p)} {fmt(df_metric.iloc[i]['P25'], is_p)} {fmt(df_metric.iloc[i]['P50'], is_p)} | {fmt_med(df_metric.iloc[i]['MEDIAN'], is_p)} | {fmt(df_metric.iloc[i]['P75'], is_p)} {fmt(df_metric.iloc[i]['P90'], is_p)} {fmt(df_metric.iloc[i]['MAX'], is_p)}")
         print()
 
-    # Pass the precipitation dataframes and typed amounts to the dashboard generator
     generate_dashboard(
-        hc_display_times, res_t, res_w, res_g, res_c, res_p,
+        master_times_api, hc_display_times, res_t, res_w, res_g, res_c, res_p,
         df_t[successful_models], df_w[successful_models], df_g[successful_models], df_c[successful_models], df_p[successful_models],
         df_ens_t, df_ens_w, df_ens_g, df_ens_c, df_ens_p,
         blended_rain, blended_snow, blended_mixed,
@@ -630,6 +811,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Blended summit weather forecast supporting single dates or multi-day ranges.")
     parser.add_argument("--date", type=str, required=True, help="Forecast date (YYYYMMDD) or range (YYYYMMDD-YYYYMMDD)")
     parser.add_argument("--location", type=str, required=True, help="Location name (e.g., 'Mount Washington, NH')")
+    parser.add_argument("--mos_cycle", type=str, choices=["00", "12"], default="00", help="GFS MOS Run Cycle to fetch (00 or 12)")
     args = parser.parse_args()
     
     date_input = args.date.strip()
@@ -645,4 +827,4 @@ if __name__ == "__main__":
         print("Error: Date must be formatted as YYYYMMDD (e.g. 20261101) or YYYYMMDD-YYYYMMDD (e.g. 20261001-20261003)")
         sys.exit(1)
         
-    get_blended_forecast(start_date, end_date, args.location)
+    get_blended_forecast(start_date, end_date, args.location, args.mos_cycle)
