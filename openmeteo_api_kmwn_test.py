@@ -270,7 +270,7 @@ def fetch_kmwn_mos(cycle, elevation_m, master_times_api):
     return df_interp['t'].tolist(), df_interp['w'].tolist()
 
 def build_mwo_text_forecast_html(dates, res_t, res_w, res_g, res_c, res_p, rain, snow, mixed):
-    html = "<div class='card'><h3>Observer-Style Text Forecast (Ensemble-Enhanced)</h3>"
+    html = "<div class='card'><h3>Text Forecast</h3>"
     periods = {}
     
     for i, d_str in enumerate(dates):
